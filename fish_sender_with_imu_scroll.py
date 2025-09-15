@@ -29,12 +29,6 @@ SCREEN_CENTER_X = SCREEN_WIDTH // 2
 SCREEN_CENTER_Y = SCREEN_HEIGHT // 2
 CIRCLE_RADIUS = 240
 
-# Tilt detection and scrolling parameters
-TILT_THRESHOLD = 15  # Minimum tilt (G) to start scrolling
-SCROLL_SMOOTHING_FACTOR = 0.8  # Low-pass filter for smooth scrolling
-MAX_SCROLL_VELOCITY = 50  # Maximum scroll speed (pixels/second)
-TILT_SCALE_FACTOR = 200  # Scaling from tilt angle to scroll velocity
-
 class BandpassFilter:
     """1st order bandpass filter for attitude detection"""
     def __init__(self, fs=100.0, lowcut=5.0, highcut=100.0):
@@ -58,7 +52,7 @@ class BandpassFilter:
 class IMUDataProcessor:
     """Processes IMU data from ESP32 and generates scroll commands with proper attitude estimation"""
     
-    def __init__(self, sample_rate=100.0):
+    def __init__(self, sample_rate=30.0):
         self.sample_rate = sample_rate
         self.dt = 1.0 / sample_rate
         
@@ -73,100 +67,75 @@ class IMUDataProcessor:
         # Attitude estimation (roll, pitch in degrees)
         self.roll_deg = 0.0
         self.pitch_deg = 0.0
+        self.prev_roll_deg = 0.0
+        self.prev_pitch_deg = 0.0
         
-        # Bandpass filters for attitude stability detection
-        self.roll_filter = BandpassFilter(sample_rate, lowcut=1.0, highcut=10.0)
-        self.pitch_filter = BandpassFilter(sample_rate, lowcut=1.0, highcut=10.0)
-        
-        # Filtered attitude values (for stillness detection)
-        self.roll_filtered = 0.0
-        self.pitch_filtered = 0.0
-        
-        # Scroll state with physics-based inertial modeling
+        # Scroll state
         self.scroll_velocity_x = 0.0
         self.scroll_velocity_y = 0.0
         self.scroll_position_x = 0.0
         self.scroll_position_y = 0.0
         
-        # Physics parameters
-        self.stillness_threshold = 12.5   # degrees (filtered attitude magnitude)
-        self.dead_zone_threshold = 15.0  # degrees (no forces below this tilt)
-        self.tilt_force_scale = 100.0    # Force scaling factor (increased for better response)
-        self.velocity_decay = 0.85       # 1st order LPF decay factor for inertia
-        self.max_scroll_velocity = 50   # pixels/second (increased for better response)
+        # Scroll input visualization
+        self.scroll_input_x = 0.0  # -1.0 to 1.0
+        self.scroll_input_y = 0.0  # -1.0 to 1.0
+        self.scroll_input_magnitude = 0.0  # 0.0 to 1.0
         
-        # Scroll area limitation (1440x1440 = 3x screen size)
-        self.max_scroll_area = 1440      # Maximum scroll area (pixels)
-        self.scroll_limit = self.max_scroll_area // 2  # ±720 pixels from center
+        # Physics parameters (optimized)
+        self.dead_zone_threshold = 10.0     # degrees (reduced for better sensitivity)
+        self.tilt_force_scale = 5000.0        # Force scaling factor
+        self.velocity_decay_base = 0.9     # Base decay factor
+        self.max_scroll_velocity = 480     # pixels/second
+        
+        # Scroll area limitation
+        self.max_scroll_area = 1440
+        self.scroll_limit = self.max_scroll_area // 2
         
         self.last_update_time = time.time()
+        self.is_initialized = False
         self.button_a_pressed = False
         self.button_b_pressed = False
         
-        # Moving average for accelerometer noise reduction
-        self.accel_history_size = 3
-        self.accel_x_history = deque(maxlen=self.accel_history_size)
-        self.accel_y_history = deque(maxlen=self.accel_history_size)
-        self.accel_z_history = deque(maxlen=self.accel_history_size)
+        # Stability detection
+        self.stability_window = deque(maxlen=5)  # Last 5 samples for stability check
         
     def process_imu_packet(self, packet_data):
-        """Process received IMU data packet from ESP32 with proper attitude estimation"""
-        # if len(packet_data) < 18:
-        #     return False
-
+        """Process received IMU data packet from ESP32"""
         try:
-            # Unpack IMU data packet (little-endian)
+            # Unpack IMU data packet
             protocol_id, timestamp, accel_x_raw, accel_y_raw, accel_z_raw, \
             gyro_roll_raw, gyro_pitch_raw, gyro_yaw_raw, button_state = struct.unpack('<BIhhhhhhB', packet_data)
             
             if protocol_id != 0x01:
                 return False
-                
-            # Step 1: Parse accelerometer and gyroscope data
+            
             # Convert raw values to physical units
-            # ESP32 scaling: ±4G range, 16-bit: ±32767, scale = 8191.75
-            #xy軸が通常の定義の逆向き
-            accel_x = accel_y_raw / 8191.75
-            accel_y = accel_x_raw / 8191.75
-            accel_z = accel_z_raw / 8191.75
+            # Note: X and Y axes are swapped in the original code
+            self.accel_x = accel_y_raw / 8191.75  # Swapped axes
+            self.accel_y = accel_x_raw / 8191.75  # Swapped axes
+            self.accel_z = accel_z_raw / 8191.75
             
-            # ESP32 scaling: ±2000deg/s range, 16-bit: ±32767, scale = 16.3835
-            gyro_roll = gyro_roll_raw / 16.3835
-            gyro_pitch = gyro_pitch_raw / 16.3835
-            gyro_yaw = gyro_yaw_raw / 16.3835
+            # Gyroscope data (deg/s)
+            self.gyro_roll = gyro_roll_raw / 16.3835
+            self.gyro_pitch = gyro_pitch_raw / 16.3835
+            self.gyro_yaw = gyro_yaw_raw / 16.3835
             
-            # Store raw sensor data
-            self.accel_x = accel_x
-            self.accel_y = accel_y
-            self.accel_z = accel_z
-            self.gyro_roll = gyro_roll
-            self.gyro_pitch = gyro_pitch
-            self.gyro_yaw = gyro_yaw
+            # Calculate attitude from accelerometer
+            gravity_magnitude = math.sqrt(self.accel_x**2 + self.accel_y**2 + self.accel_z**2)
             
-            # Apply moving average filter to reduce noise
-            self.accel_x_history.append(accel_x)
-            self.accel_y_history.append(accel_y)
-            self.accel_z_history.append(accel_z)
-            
-            # Step 2: Estimate steady-state attitude (roll, pitch) from accelerometer
-            # Note: Low-pass filter removed as it's already done on ESP32 side
-            if len(self.accel_x_history) >= self.accel_history_size:
-                # Use current accelerometer data directly (ESP32 already filtered)
-                ax = accel_x
-                ay = accel_y
-                az = accel_z
+            # Only update attitude if gravity vector is reasonable (0.8g to 1.2g)
+            if 0.8 < gravity_magnitude < 1.2:
+                # Store previous values for stability detection
+                self.prev_roll_deg = self.roll_deg
+                self.prev_pitch_deg = self.pitch_deg
                 
-                # Calculate roll and pitch from accelerometer (assuming gravity dominates)
-                # Roll: rotation around X-axis (device forward/back tilt)
-                # Pitch: rotation around Y-axis (device left/right tilt)
-                self.roll_deg = math.degrees(math.atan2(ay, math.sqrt(ax**2 + az**2)))
-                self.pitch_deg = math.degrees(math.atan2(-ax, math.sqrt(ay**2 + az**2)))
+                # Calculate roll and pitch
+                # Roll: rotation around X-axis (left-right tilt)
+                # Pitch: rotation around Y-axis (forward-back tilt)
+                self.roll_deg = math.degrees(math.atan2(-self.accel_y, math.sqrt(self.accel_x**2 + self.accel_z**2)))
+                self.pitch_deg = math.degrees(math.atan2(-self.accel_x, math.sqrt(self.accel_y**2 + self.accel_z**2)))
                 
-                # Step 3: Apply bandpass filter to attitude for stillness detection
-                self.roll_filtered = self.roll_filter.apply(self.roll_deg)
-                self.pitch_filtered = self.pitch_filter.apply(self.pitch_deg)
-                
-                # Step 4: Update scroll based on attitude and stillness
+                # Update scroll based on attitude
                 self._update_scroll_from_attitude()
             
             # Extract button states
@@ -180,60 +149,78 @@ class IMUDataProcessor:
             return False
     
     def _update_scroll_from_attitude(self):
-        """Update scroll position based on attitude estimation and stillness detection"""
+        """Update scroll position based on attitude with dt compensation"""
         current_time = time.time()
         dt = current_time - self.last_update_time
+        
+        # Handle initialization and long pauses
+        if not self.is_initialized or dt > 0.1:
+            self.last_update_time = current_time
+            self.is_initialized = True
+            return
+        
         self.last_update_time = current_time
         
-        # if dt > 0.1:  # Skip if time delta is too large (first call or long pause)
-        #     return
-            
-        # Step 3: Check if device is in steady state (stillness detection)
-        # Use bandpass-filtered attitude magnitude to detect stability
-        filtered_attitude_magnitude = math.sqrt(self.roll_filtered**2 + self.pitch_filtered**2)
-        is_still = filtered_attitude_magnitude < self.stillness_threshold
+        # Check stability using angular velocity
+        angular_change = math.sqrt((self.roll_deg - self.prev_roll_deg)**2 + 
+                                  (self.pitch_deg - self.prev_pitch_deg)**2)
+        self.stability_window.append(angular_change)
         
-        # Check if tilt is within dead zone (< 15 degrees total tilt)
-        total_tilt_magnitude = math.sqrt(self.roll_deg**2 + self.pitch_deg**2)
-        in_dead_zone = total_tilt_magnitude < self.dead_zone_threshold
+        # Device is stable if recent angular changes are small
+        is_stable = len(self.stability_window) >= 3 and max(self.stability_window) < 5.0
         
-        # Step 4: Physics-based scrolling with inertial modeling
-        if is_still and not in_dead_zone:
-            # Device is steady and tilted enough - apply tilt forces
-            # Convert attitude angles to scroll forces
-            # Roll (forward/back tilt) → Y scroll (up/down on screen)
-            # Pitch (left/right tilt) → X scroll (left/right on screen)
-            
-            # Use stronger force calculation for better responsiveness
-            force_x = math.sin(math.radians(self.pitch_deg)) * self.tilt_force_scale
-            force_y = math.sin(math.radians(self.roll_deg)) * self.tilt_force_scale
-            
-            # Apply forces to velocity (acceleration = force, assuming unit mass)
-            acceleration_x = force_x
-            acceleration_y = force_y
-            
-            # Update velocity with acceleration and reduced decay for steady forces
-            self.scroll_velocity_x = self.scroll_velocity_x * self.velocity_decay + acceleration_x * dt
-            self.scroll_velocity_y = self.scroll_velocity_y * self.velocity_decay + acceleration_y * dt
-            
+        # Calculate total tilt magnitude
+        total_tilt = math.sqrt(self.roll_deg**2 + self.pitch_deg**2)
+        in_dead_zone = total_tilt < self.dead_zone_threshold
+        
+        # Calculate scroll input (normalized -1 to 1)
+        if not in_dead_zone:
+            # Normalize tilt to input range
+            max_tilt = 45.0  # Maximum expected tilt angle
+            self.scroll_input_x = max(-1.0, min(1.0, self.pitch_deg / max_tilt))
+            self.scroll_input_y = max(-1.0, min(1.0, -self.roll_deg / max_tilt))
+            self.scroll_input_magnitude = min(1.0, total_tilt / max_tilt)
         else:
-            # Device is moving OR within dead zone - apply stronger decay
-            stronger_decay = 0.7  # More aggressive decay when not applying forces
-            self.scroll_velocity_x *= stronger_decay
-            self.scroll_velocity_y *= stronger_decay
+            self.scroll_input_x = 0.0
+            self.scroll_input_y = 0.0
+            self.scroll_input_magnitude = 0.0
         
-        # Limit maximum scroll velocity
+        # Apply forces based on tilt (with dt compensation)
+        if is_stable and not in_dead_zone:
+            # Calculate tilt-based forces
+            tilt_factor = (total_tilt - self.dead_zone_threshold) / 30.0
+            tilt_factor = max(0.0, min(1.0, tilt_factor))
+            
+            # Forces proportional to tilt with dt compensation
+            force_x = self.pitch_deg * tilt_factor * self.tilt_force_scale
+            force_y = -self.roll_deg * tilt_factor * self.tilt_force_scale
+            
+            # Adaptive decay based on dt (compensate for variable frame time)
+            dt_factor = dt * self.sample_rate  # Normalize dt to expected frame time
+            velocity_decay = self.velocity_decay_base ** dt_factor
+            
+            # Update velocity with dt-compensated physics
+            self.scroll_velocity_x = self.scroll_velocity_x * velocity_decay + force_x * dt
+            self.scroll_velocity_y = self.scroll_velocity_y * velocity_decay + force_y * dt
+        else:
+            # Stronger decay when not applying forces (also dt-compensated)
+            dt_factor = dt * self.sample_rate
+            strong_decay = 0.7 ** dt_factor
+            self.scroll_velocity_x *= strong_decay
+            self.scroll_velocity_y *= strong_decay
+        
+        # Limit maximum velocity
         velocity_magnitude = math.sqrt(self.scroll_velocity_x**2 + self.scroll_velocity_y**2)
         if velocity_magnitude > self.max_scroll_velocity:
             scale = self.max_scroll_velocity / velocity_magnitude
             self.scroll_velocity_x *= scale
             self.scroll_velocity_y *= scale
         
-        # Integrate velocity to get position
+        # Update position with dt compensation
         self.scroll_position_x += self.scroll_velocity_x * dt
         self.scroll_position_y += self.scroll_velocity_y * dt
         
-        # Apply scroll area limitation (1440x1440 maximum area)
+        # Apply boundaries
         self.scroll_position_x = max(-self.scroll_limit, min(self.scroll_limit, self.scroll_position_x))
         self.scroll_position_y = max(-self.scroll_limit, min(self.scroll_limit, self.scroll_position_y))
     
@@ -242,32 +229,67 @@ class IMUDataProcessor:
         return {
             'scroll_x': int(self.scroll_position_x),
             'scroll_y': int(self.scroll_position_y),
-            'rotation': 0  # Not implemented yet
+            'rotation': 0
         }
+    
+    def get_scroll_direction_display(self):
+        """Get visual representation of scroll input direction and strength"""
+        if self.scroll_input_magnitude < 0.01:
+            return "CENTER"
+        
+        # Calculate angle in degrees
+        angle = math.degrees(math.atan2(self.scroll_input_y, self.scroll_input_x))
+        if angle < 0:
+            angle += 360
+        
+        # Determine primary direction
+        directions = [
+            (0, "→"), (45, "↗"), (90, "↑"), (135, "↖"),
+            (180, "←"), (225, "↙"), (270, "↓"), (315, "↘")
+        ]
+        
+        # Find closest direction
+        min_diff = 360
+        direction_symbol = "?"
+        for dir_angle, symbol in directions:
+            diff = abs(angle - dir_angle)
+            if diff > 180:
+                diff = 360 - diff
+            if diff < min_diff:
+                min_diff = diff
+                direction_symbol = symbol
+        
+        # Create strength indicator
+        strength_bars = int(self.scroll_input_magnitude * 5)
+        strength_display = "█" * strength_bars + "░" * (5 - strength_bars)
+        
+        return f"{direction_symbol} {strength_display}"
     
     def get_debug_info(self):
         """Get debug information for display"""
-        filtered_magnitude = math.sqrt(self.roll_filtered**2 + self.pitch_filtered**2)
-        is_still = filtered_magnitude < self.stillness_threshold
-        total_tilt_magnitude = math.sqrt(self.roll_deg**2 + self.pitch_deg**2)
-        in_dead_zone = total_tilt_magnitude < self.dead_zone_threshold
+        total_tilt = math.sqrt(self.roll_deg**2 + self.pitch_deg**2)
+        is_stable = len(self.stability_window) >= 3 and max(self.stability_window) < 5.0
+        in_dead_zone = total_tilt < self.dead_zone_threshold
+        
+        # Calculate actual dt for display
+        current_time = time.time()
+        actual_dt = current_time - self.last_update_time if self.is_initialized else 0.0
         
         return {
             'roll_deg': self.roll_deg,
             'pitch_deg': self.pitch_deg,
-            'total_tilt_magnitude': total_tilt_magnitude,
-            'roll_filtered': self.roll_filtered,
-            'pitch_filtered': self.pitch_filtered,
-            'filtered_magnitude': filtered_magnitude,
-            'is_still': is_still,
+            'total_tilt': total_tilt,
+            'is_stable': is_stable,
             'in_dead_zone': in_dead_zone,
             'scroll_pos_x': self.scroll_position_x,
             'scroll_pos_y': self.scroll_position_y,
             'scroll_vel_x': self.scroll_velocity_x,
             'scroll_vel_y': self.scroll_velocity_y,
-            'accel_x': self.accel_x,
-            'accel_y': self.accel_y,
-            'accel_z': self.accel_z,
+            'scroll_input_x': self.scroll_input_x,
+            'scroll_input_y': self.scroll_input_y,
+            'scroll_input_magnitude': self.scroll_input_magnitude,
+            'scroll_direction': self.get_scroll_direction_display(),
+            'actual_dt': actual_dt * 1000,  # Convert to ms
             'button_a': self.button_a_pressed,
             'button_b': self.button_b_pressed
         }
@@ -398,8 +420,8 @@ class RealisticFishModel:
         return (dx * dx + dy * dy) <= (CIRCLE_RADIUS * CIRCLE_RADIUS)
 
 class FishDisplayWithIMU:
-    def __init__(self, port, baudrate=115200):
-        self.ser = serial.Serial(port, baudrate, timeout=0.01)  # Non-blocking read
+    def __init__(self, port, baudrate=500000):
+        self.ser = serial.Serial(port, baudrate, timeout=0.5)  # Non-blocking read
         self.fish_models = []
         self.fish_data_cache = None
         self.imu_processor = IMUDataProcessor()
@@ -482,7 +504,7 @@ class FishDisplayWithIMU:
         """Process incoming IMU data from ESP32"""
         try:
             # Read available data
-            data = self.ser.read(32)  # Read up to 64 bytes
+            data = self.ser.read(32)  # Read up to 32 bytes
             if data:
                 self.receive_buffer.extend(data)
                 
@@ -492,7 +514,7 @@ class FishDisplayWithIMU:
                         packet_data = bytes(self.receive_buffer[:18])
                         if self.imu_processor.process_imu_packet(packet_data):
                             # Successfully processed, remove from buffer
-                            del self.receive_buffer[:19]
+                            del self.receive_buffer[:18]
                         else:
                             # Invalid packet, shift buffer
                             del self.receive_buffer[0]
@@ -540,24 +562,38 @@ class FishDisplayWithIMU:
         self.ser.write(packet)
     
     def print_status(self):
-        """Print current system status with attitude information"""
+        """Print current system status with attitude and scroll input visualization"""
         debug_info = self.imu_processor.get_debug_info()
-        still_status = "STILL" if debug_info['is_still'] else "MOVING"
-        dead_zone_status = "DEAD_ZONE" if debug_info['in_dead_zone'] else "ACTIVE"
         
-        print(f"Attitude: Roll={debug_info['roll_deg']:.1f}° Pitch={debug_info['pitch_deg']:.1f}° "
-              f"Total={debug_info['total_tilt_magnitude']:.1f}° | "
-              f"Status: {still_status} {dead_zone_status} | "
-              f"Scroll: ({debug_info['scroll_pos_x']:.0f},{debug_info['scroll_pos_y']:.0f}) | "
-              f"Vel: ({debug_info['scroll_vel_x']:.1f},{debug_info['scroll_vel_y']:.1f}) | "
-              f"Filt_Mag={debug_info['filtered_magnitude']:.1f}° | "
-              f"Accel: ({debug_info['accel_x']:.2f},{debug_info['accel_y']:.2f},{debug_info['accel_z']:.2f})G")
+        # Status indicators
+        stable_status = "STABLE" if debug_info['is_stable'] else "MOVING"
+        zone_status = "ACTIVE" if not debug_info['in_dead_zone'] else "DEAD_ZONE"
+        
+        # Tilt information
+        tilt_info = (f"Tilt: R={debug_info['roll_deg']:+6.1f}° P={debug_info['pitch_deg']:+6.1f}° "
+                     f"Total={debug_info['total_tilt']:5.1f}°")
+        
+        # Scroll input visualization
+        scroll_input = (f"Input: {debug_info['scroll_direction']} "
+                       f"({debug_info['scroll_input_x']:+.2f}, {debug_info['scroll_input_y']:+.2f}) "
+                       f"Mag={debug_info['scroll_input_magnitude']:.2f}")
+        
+        # Scroll state
+        scroll_state = (f"Pos=({debug_info['scroll_pos_x']:+6.0f},{debug_info['scroll_pos_y']:+6.0f}) "
+                       f"Vel=({debug_info['scroll_vel_x']:+5.1f},{debug_info['scroll_vel_y']:+5.1f})")
+        
+        # Timing information
+        timing_info = f"dt={debug_info['actual_dt']:.1f}ms"
+        
+        # Combine all information
+        print(f"{tilt_info} | {stable_status:6s} {zone_status:9s} | {scroll_input} | {scroll_state} | {timing_info}")
     
     def run_simulation(self, duration_seconds=300, num_fish=4, update_rate_hz=10):
         """Run the integrated fish display and IMU scroll system"""
         print(f"Starting integrated fish display with IMU scrolling")
         print(f"Duration: {duration_seconds}s, Fish: {num_fish}, Rate: {update_rate_hz}Hz")
         print("Tilt the device to scroll the fish display")
+        print("-" * 120)
         
         self.initialize_fish(num_fish)
         
@@ -588,7 +624,6 @@ class FishDisplayWithIMU:
                 
                 # Maintain update rate
                 elapsed = time.time() - loop_start_time
-                # print(elapsed)
                 sleep_time = max(0, update_interval - elapsed)
                 time.sleep(sleep_time)
                 
@@ -610,7 +645,7 @@ def main():
     
     port = sys.argv[1]
     system = FishDisplayWithIMU(port)
-    system.run_simulation(duration_seconds=300, num_fish=2,  update_rate_hz=100)
+    system.run_simulation(duration_seconds=300, num_fish=2, update_rate_hz=100)
 
 if __name__ == "__main__":
     main()
