@@ -9,10 +9,15 @@
 
 // Fish display system configuration
 #define MAX_FISH 10
+#define MAX_HEALTH 10  // Maximum number of poi to display
+#define MAX_ARROWS 10  // Maximum direction arrows for offscreen fish
 #define CIRCLE_CENTER_X 240
 #define CIRCLE_CENTER_Y 240
 #define CIRCLE_RADIUS 240
+#define ARROW_RADIUS 230     // Arrow placement radius
 #define FISH_DOT_SIZE 8
+#define SCREEN_WIDTH 480
+#define SCREEN_HEIGHT 480
 
 // IMU and scrolling configuration
 #define IMU_SAMPLE_RATE_HZ 50
@@ -68,13 +73,28 @@ struct IMUDataPacket {
     uint8_t button_state;
 } __attribute__((packed));
 
+struct GameEventPacket {
+    uint8_t protocol_id;        // 0x03
+    uint32_t timestamp;         // 4 bytes milliseconds
+    uint8_t sound_flag;         // 1=trial, 2=success, 3=game_clear, 4=game_over
+    uint8_t health_value;       // 0-3 health points
+    uint8_t reserved;           // padding
+} __attribute__((packed));
+
 // Global variables
 lv_obj_t* fish_objects[MAX_FISH] = {nullptr};
 lv_obj_t* background_tiles[9] = {nullptr};
+lv_obj_t* health_poi_objects[MAX_HEALTH] = {nullptr};  // Array of poi image objects
+lv_obj_t* arrow_objects[MAX_ARROWS] = {nullptr};      // Direction arrow canvas objects
 FishData current_fish[MAX_FISH];
 uint8_t active_fish_count = 0;
 uint8_t serial_buffer[SERIAL_BUFFER_SIZE];
 size_t buffer_pos = 0;
+
+// Game state
+uint8_t current_health = 5;  // Default health: 5 poi
+uint8_t max_health = 5;      // Maximum health (set by first 0x03 packet)
+bool health_display_initialized = false;  // Track if health display is ready
 
 // Flag to indicate if display needs update
 volatile bool display_needs_update = false;
@@ -101,11 +121,18 @@ void create_fish_display();
 void create_tiled_background();
 void update_background_scroll();
 void draw_fish_images();
+void refresh_background_only();
 bool is_point_in_circle(int32_t x, int32_t y);
 void handle_serial_data();
 bool process_fish_packet(const uint8_t* data, size_t length);
 bool process_scroll_command(const uint8_t* data, size_t length);
+bool process_game_event(const uint8_t* data, size_t length);
 void create_fish_objects();
+void create_arrow_objects();
+void draw_direction_arrows();
+void create_health_display();
+void update_health_display();
+void play_sound_effect(uint8_t sound_type);
 const lv_image_dsc_t* get_fish_image(uint8_t sprite_id, int16_t direction);
 void send_imu_data_fast();
 void IRAM_ATTR process_imu_sampling();
@@ -141,7 +168,121 @@ void create_fish_objects() {
     }
 }
 
-// Optimized fish drawing - only update when needed
+// Create arrow indicator objects (simple triangle using label)
+void create_arrow_objects() {
+    for (int i = 0; i < MAX_ARROWS; i++) {
+        // Use a simple filled triangle character
+        arrow_objects[i] = lv_label_create(lv_screen_active());
+        lv_label_set_text(arrow_objects[i], LV_SYMBOL_RIGHT);  // Use built-in arrow symbol
+        lv_obj_set_style_text_color(arrow_objects[i], lv_color_make(220, 100, 0), 0);  // Orange/yellow
+        lv_obj_set_style_text_font(arrow_objects[i], &lv_font_montserrat_14, 0);
+        lv_obj_add_flag(arrow_objects[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(arrow_objects[i]);
+    }
+
+    Serial.println("Arrow objects created");
+}
+
+// Draw direction arrows for offscreen fish
+void draw_direction_arrows() {
+    int arrow_count = 0;
+
+    // Hide all arrows first
+    for (int i = 0; i < MAX_ARROWS; i++) {
+        lv_obj_add_flag(arrow_objects[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Check each fish for offscreen position
+    for (int i = 0; i < active_fish_count && i < MAX_FISH && arrow_count < MAX_ARROWS; i++) {
+        // Calculate screen position (world position - scroll offset)
+        int32_t screen_x = current_fish[i].x - scroll_offset_x;
+        int32_t screen_y = current_fish[i].y - scroll_offset_y;
+
+        // Check if fish is outside visible circle
+        if (!is_point_in_circle(screen_x, screen_y)) {
+            // Calculate angle from center to fish
+            float dx = screen_x - CIRCLE_CENTER_X;
+            float dy = screen_y - CIRCLE_CENTER_Y;
+            float angle_rad = atan2f(dy, dx);
+            float angle_deg = angle_rad * 180.0f / M_PI;
+
+            // Calculate arrow position on boundary (radius 230)
+            int arrow_x = CIRCLE_CENTER_X + (int)(ARROW_RADIUS * cosf(angle_rad));
+            int arrow_y = CIRCLE_CENTER_Y + (int)(ARROW_RADIUS * sinf(angle_rad));
+
+            // Set transform pivot to center of label
+            lv_obj_set_style_transform_pivot_x(arrow_objects[arrow_count], 8, 0);
+            lv_obj_set_style_transform_pivot_y(arrow_objects[arrow_count], 8, 0);
+
+            // Set rotation (LVGL uses 0.1 degree units)
+            lv_obj_set_style_transform_angle(arrow_objects[arrow_count], (int16_t)(angle_deg * 10), 0);
+
+            // Position arrow
+            lv_obj_set_pos(arrow_objects[arrow_count], arrow_x - 8, arrow_y - 8);
+
+            // Show arrow
+            lv_obj_clear_flag(arrow_objects[arrow_count], LV_OBJ_FLAG_HIDDEN);
+
+            arrow_count++;
+        }
+    }
+}
+
+// Create health display with poi images
+void create_health_display() {
+    // Create poi image objects (initially hidden)
+    for (int i = 0; i < MAX_HEALTH; i++) {
+        health_poi_objects[i] = lv_image_create(lv_screen_active());
+        lv_image_set_src(health_poi_objects[i], &poi);
+        lv_obj_add_flag(health_poi_objects[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(health_poi_objects[i]);
+    }
+
+    Serial.println("Health display created (poi images, hidden until initialized)");
+}
+
+// Update health display based on current health value
+void update_health_display() {
+    // Only update if health display is initialized
+    if (!health_display_initialized) {
+        return;
+    }
+
+    // Calculate starting position for centered display
+    // poi image is 32x32, with 10px spacing between images
+    const int poi_width = 32;
+    const int poi_spacing = 10;
+    const int total_width = poi_width + (max_health - 1) * poi_spacing;
+    const int start_x = (SCREEN_WIDTH - total_width) / 2;
+    const int y_position = 10;  // Top margin
+
+    // Update poi images
+    for (int i = 0; i < MAX_HEALTH; i++) {
+        if (i < max_health) {
+            // Calculate position for this poi
+            int x_position = start_x + i * poi_spacing;
+            lv_obj_set_pos(health_poi_objects[i], x_position, y_position);
+
+            // Show or hide based on current health
+            if (i < current_health) {
+                // Show intact poi
+                lv_obj_clear_flag(health_poi_objects[i], LV_OBJ_FLAG_HIDDEN);
+                lv_image_set_src(health_poi_objects[i], &poi);
+            } else {
+                // Hide broken poi (or could show a broken image if available)
+                lv_obj_add_flag(health_poi_objects[i], LV_OBJ_FLAG_HIDDEN);
+            }
+        } else {
+            // Hide unused poi objects
+            lv_obj_add_flag(health_poi_objects[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    Serial.printf("Health updated: %d/%d poi remaining\n", current_health, max_health);
+}
+
+
+// 魚描画関数も最適化
 void draw_fish_images() {
     static uint8_t prev_fish_count = 0;
     static int32_t prev_scroll_x = 0;
@@ -159,6 +300,20 @@ void draw_fish_images() {
     prev_scroll_x = scroll_offset_x;
     prev_scroll_y = scroll_offset_y;
     
+    // 魚が0匹の場合は全て非表示にして終了
+    if (active_fish_count == 0) {
+        for (int i = 0; i < MAX_FISH; i++) {
+            lv_obj_add_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        // Hide arrows too
+        for (int i = 0; i < MAX_ARROWS; i++) {
+            lv_obj_add_flag(arrow_objects[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        display_needs_update = false;
+        return;  // 背景のみ表示で処理終了
+    }
+    
+    // 通常の魚描画処理
     // Hide all fish objects first
     for (int i = 0; i < MAX_FISH; i++) {
         lv_obj_add_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN);
@@ -183,14 +338,34 @@ void draw_fish_images() {
             continue;
         }
         
-        lv_obj_set_pos(fish_objects[i], 
-                       display_x - img_w / 2, 
+        lv_obj_set_pos(fish_objects[i],
+                       display_x - img_w / 2,
                        display_y - img_h / 2);
-        
+
         lv_obj_clear_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN);
     }
-    
+
+    // Draw direction arrows for offscreen fish
+    draw_direction_arrows();
+
     display_needs_update = false;
+}
+
+// 必要に応じて背景リフレッシュ関数も追加
+void refresh_background_only() {
+    // 魚を全て非表示
+    for (int i = 0; i < MAX_FISH; i++) {
+        lv_obj_add_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    // 背景の更新を強制
+    scroll_needs_update = true;
+    update_background_scroll();
+    
+    // LVGL更新
+    lv_obj_invalidate(lv_screen_active());
+    
+    Serial.println("Background refreshed - fish cleared");
 }
 
 // Process Protocol ID 0x02 fish data packet
@@ -218,19 +393,49 @@ bool process_fish_packet(const uint8_t* data, size_t length) {
 // Process Protocol ID 0x01 scroll command packet
 bool process_scroll_command(const uint8_t* data, size_t length) {
     if (length < sizeof(ScrollCommandPacket)) return false;
-    
+
     ScrollCommandPacket* packet = (ScrollCommandPacket*)data;
-    
+
     if (packet->protocol_id != 0x01) return false;
-    
+
     // Update scroll offsets
     scroll_offset_x = packet->scroll_x;
     scroll_offset_y = packet->scroll_y;
-    
+
     // Mark for update
     scroll_needs_update = true;
     display_needs_update = true;
-    
+
+    return true;
+}
+
+// Process Protocol ID 0x03 game event packet
+bool process_game_event(const uint8_t* data, size_t length) {
+    if (length < sizeof(GameEventPacket)) return false;
+
+    GameEventPacket* packet = (GameEventPacket*)data;
+
+    if (packet->protocol_id != 0x03) return false;
+
+    // Initialize health display on first 0x03 packet received
+    if (!health_display_initialized) {
+        health_display_initialized = true;
+        // Set max_health from initial health value
+        max_health = packet->health_value;
+        if (max_health > MAX_HEALTH) max_health = MAX_HEALTH;  // Clamp to maximum
+        Serial.printf("Health display initialized by 0x03 packet (max_health=%d)\n", max_health);
+    }
+
+    // Update health value
+    current_health = packet->health_value;
+    if (current_health > max_health) current_health = max_health;  // Clamp to max
+    update_health_display();
+
+    // Play sound effect based on sound flag
+    // play_sound_effect(packet->sound_flag);
+
+    Serial.printf("Game Event: Sound=%d, Health=%d\n", packet->sound_flag, packet->health_value);
+
     return true;
 }
 
@@ -299,7 +504,12 @@ void handle_serial_data() {
             if (buffer_pos - processed >= 6) {
                 uint8_t fish_count = packet_start[5];
                 size_t expected_size = 6 + (fish_count * sizeof(FishData));
-                
+
+                if (fish_count == 0)
+                {
+                    refresh_background_only();
+                }
+
                 if (buffer_pos - processed >= expected_size) {
                     if (process_fish_packet(packet_start, expected_size)) {
                         processed += expected_size;
@@ -312,7 +522,19 @@ void handle_serial_data() {
             } else {
                 break; // Need more data
             }
-        } else {
+        }
+        else if (packet_start[0] == 0x03) {  // Game event
+            if (buffer_pos - processed >= sizeof(GameEventPacket)) {
+                if (process_game_event(packet_start, sizeof(GameEventPacket))) {
+                    processed += sizeof(GameEventPacket);
+                } else {
+                    processed++; // Skip invalid byte
+                }
+            } else {
+                break; // Need more data
+            }
+        }
+        else {
             processed++; // Skip unknown byte
         }
     }
@@ -384,16 +606,20 @@ void create_tiled_background() {
 void create_fish_display() {
     create_tiled_background();
     create_fish_objects();
-    
-    lv_obj_t* title = lv_label_create(lv_screen_active());
+    create_arrow_objects();
+    create_health_display();
+
+    // lv_obj_t* title = lv_label_create(lv_screen_active());
     // lv_label_set_text(title, "Fish Display System - Optimized");
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+    // lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    // lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    // lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+
 }
 
 void Driver_Init() {
-    Serial.println("Driver_Inité–‹å§‹");
+    Serial.println("Driver_Init");
     
     I2C_Init();
     delay(120);
@@ -404,7 +630,7 @@ void Driver_Init() {
     Backlight_Init();
     Set_Backlight(100);
     
-    Serial.println("Driver_Initå®Œäº†");
+    Serial.println("Driver_Init");
 }
 
 void setup() {
@@ -462,15 +688,15 @@ void loop() {
         if (scroll_needs_update) {
             update_background_scroll();
         }
-        
+
         // Update fish display if needed
         if (display_needs_update) {
             draw_fish_images();
         }
-        
+
         // Handle LVGL tasks
         lv_timer_handler();
-        
+
         last_lvgl_time = current_time;
     }
     

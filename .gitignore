@@ -26,3 +26,8 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Claude communication
+claude_communication.md
+CLAUDE.md
+IMU_INTEGRATION_SUMMARY.md

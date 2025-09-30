@@ -21,6 +21,8 @@ import math
 import threading
 from collections import deque
 from scipy import signal
+import subprocess
+import serial.tools.list_ports
 
 # Display parameters matching ESP32 code
 SCREEN_WIDTH = 480
@@ -28,6 +30,13 @@ SCREEN_HEIGHT = 480
 SCREEN_CENTER_X = SCREEN_WIDTH // 2
 SCREEN_CENTER_Y = SCREEN_HEIGHT // 2
 CIRCLE_RADIUS = 240
+INIT_FISH_RADIUS = 240 * 2.5
+
+# Fish catching game parameters
+CATCH_TARGET_X = -180  # Target position relative to screen center
+CATCH_TARGET_Y = 0
+CATCH_RADIUS = 60       # Success detection radius (as specified)
+DEFAULT_HEALTH = 5      # Starting health points (3 poi)
 
 class BandpassFilter:
     """1st order bandpass filter for attitude detection"""
@@ -35,19 +44,116 @@ class BandpassFilter:
         self.fs = fs
         self.lowcut = lowcut
         self.highcut = highcut
-        
+
         # Design bandpass filter
         nyquist = 0.5 * fs
         low = lowcut / nyquist
         high = highcut / nyquist
-        self.b, self.a = signal.butter(1, [low, high], btype='band')
-        
+        self.b, self.a = signal.butter(1, [low, high], btype='band', fs=fs)
+
         # Filter state
         self.zi = signal.lfilter_zi(self.b, self.a)
-        
+
     def apply(self, x):
         y, self.zi = signal.lfilter(self.b, self.a, [x], zi=self.zi)
         return y[0]
+
+class MotionDetector:
+    """Detects fish catching motion using highpass-filtered acceleration"""
+    def __init__(self, sample_rate=30.0):
+        self.sample_rate = sample_rate
+
+        # Highpass filters for each axis
+        self.filter_x = BandpassFilter(sample_rate, lowcut=2.0, highcut=20.0)
+        self.filter_y = BandpassFilter(sample_rate, lowcut=2.0, highcut=20.0)
+        self.filter_z = BandpassFilter(sample_rate, lowcut=2.0, highcut=20.0)
+
+        # Motion detection parameters (adjustable)
+        self.min_acceleration_threshold = 0.5   # Minimum motion (G)
+        self.max_acceleration_threshold = 1.0   # Maximum motion (G)
+        self.motion_duration_threshold = 0.1    # Minimum motion duration (seconds)
+
+        # Motion state tracking
+        self.motion_history = deque(maxlen=10)  # Last 10 samples
+        self.last_motion_time = 0
+        self.motion_active = False
+
+    def update_acceleration(self, accel_x, accel_y, accel_z):
+        """Process new acceleration data and detect catching motion"""
+        # Apply highpass filtering to remove gravity and low-frequency noise
+        filtered_y = self.filter_x.apply(accel_x)
+        filtered_x = self.filter_y.apply(accel_y)
+        filtered_z = self.filter_z.apply(accel_z)
+
+        # Calculate magnitude of filtered acceleration
+        magnitude = math.sqrt(filtered_x**2 + filtered_y**2 + filtered_z**2)
+
+        # Store in history
+        current_time = time.time()
+        self.motion_history.append({
+            'time': current_time,
+            'magnitude': magnitude,
+            'y_accel': filtered_y  # Y-axis is horizontal motion for catching
+        })
+
+        # Check for catching motion detection
+        return self._detect_catching_motion(current_time)
+
+    def _detect_catching_motion(self, current_time):
+        """Detect if current motion pattern matches fish catching"""
+        if len(self.motion_history) < 3:
+            return False
+
+        # Look for significant Y-axis motion (horizontal catching motion)
+        recent_samples = [s for s in self.motion_history if current_time - s['time'] < self.motion_duration_threshold]
+
+        if len(recent_samples) < 2:
+            return False
+
+        # Check for appropriate motion magnitude
+        max_magnitude = max(s['magnitude'] for s in recent_samples)
+        avg_magnitude = sum(s['magnitude'] for s in recent_samples) / len(recent_samples)
+
+        # Motion must be within thresholds
+        magnitude_ok = (self.min_acceleration_threshold <= avg_magnitude <= self.max_acceleration_threshold)
+
+        # Check for primarily horizontal motion (Y-axis)
+        y_motion = max(abs(s['y_accel']) for s in recent_samples)
+        horizontal_dominant = y_motion > (max_magnitude * 0.4)  # Y-axis should be significant
+
+        # Detect motion start (wasn't moving, now moving)
+        was_still = not self.motion_active
+        self.motion_active = avg_magnitude > self.min_acceleration_threshold
+
+        # Trigger detection on motion start with appropriate characteristics
+        catching_detected = (was_still and self.motion_active and
+                           magnitude_ok and horizontal_dominant)
+
+        if catching_detected:
+            self.last_motion_time = current_time
+
+        return catching_detected
+
+    def get_debug_info(self):
+        """Get debug information for motion detection"""
+        if not self.motion_history:
+            return {
+                'magnitude': 0.0,
+                'y_accel': 0.0,
+                'motion_active': False,
+                'threshold_min': self.min_acceleration_threshold,
+                'threshold_max': self.max_acceleration_threshold
+            }
+
+        latest = self.motion_history[-1]
+        return {
+            'magnitude': latest['magnitude'],
+            'y_accel': latest['y_accel'],
+            'motion_active': self.motion_active,
+            'threshold_min': self.min_acceleration_threshold,
+            'threshold_max': self.max_acceleration_threshold,
+            'history_size': len(self.motion_history)
+        }
 
 class IMUDataProcessor:
     """Processes IMU data from ESP32 and generates scroll commands with proper attitude estimation"""
@@ -425,16 +531,132 @@ class FishDisplayWithIMU:
         self.fish_models = []
         self.fish_data_cache = None
         self.imu_processor = IMUDataProcessor()
+        self.motion_detector = MotionDetector()
         self.running = True
-        
+
+        # Game state
+        self.current_health = DEFAULT_HEALTH
+        self.game_over = False
+        self.fish_caught = 0
+        self.total_fish_spawned = 0
+
+        # Startup stability delay
+        self.start_time = time.time()
+        self.stability_delay = 1.0  # 1 second delay for stability
+
         print(f"Connected to {port} at {baudrate} baud")
-        
+        print(f"Fish catching game initialized - Health: {self.current_health}")
+
         # Load training data from fish analysis
         self._load_fish_analysis_data()
-        
+
         # Buffer for incoming data
         self.receive_buffer = bytearray()
-        
+
+        # Initialize sound system
+        self._initialize_sound_system()
+
+        # Send initial health value to ESP32
+        self._send_initial_health()
+
+    def _send_initial_health(self):
+        """Send initial health value to ESP32 for display initialization"""
+        try:
+            # Wait a bit for serial connection to stabilize
+            time.sleep(0.1)
+            packet = self.create_game_event_packet(1, self.current_health)  # sound_flag=1 (trial/init)
+            self.ser.write(packet)
+            print(f"Initial health sent to ESP32: {self.current_health} poi")
+        except Exception as e:
+            print(f"Failed to send initial health: {e}")
+
+    def _initialize_sound_system(self):
+        """Initialize sound system for game events"""
+        try:
+            # Sound file paths
+            self.sound_files = {
+                'trial': './sound/trial.mp3',
+                'success': './sound/success.mp3',
+                'game_over': './sound/game_over.mp3',
+                'game_clear': './sound/game_clear.mp3'
+            }
+
+            # Verify sound files exist
+            missing_files = []
+            for event, file_path in self.sound_files.items():
+                if not os.path.exists(file_path):
+                    missing_files.append(f"{event}: {file_path}")
+
+            if missing_files:
+                print("Warning: Sound files not found:")
+                for missing in missing_files:
+                    print(f"  - {missing}")
+            else:
+                print("All sound files found")
+
+            # Test audio player availability
+            players = ['ffplay', 'mpg123', 'cvlc']
+            available_players = []
+            for player in players:
+                try:
+                    subprocess.run([player, '--version'], check=False,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 timeout=2)
+                    available_players.append(player)
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    pass
+
+            if available_players:
+                print(f"Available audio players: {', '.join(available_players)}")
+                print("Sound system initialized successfully")
+            else:
+                print("Warning: No audio players found. Sound will be disabled.")
+
+        except Exception as e:
+            print(f"Warning: Failed to initialize sound system: {e}")
+            self.sound_files = {}
+
+    def _play_sound_async(self, event_type):
+        """Play sound asynchronously in separate thread"""
+        def play_sound():
+            try:
+                if event_type in self.sound_files:
+                    file_path = self.sound_files[event_type]
+                    if os.path.exists(file_path):
+                        # Try multiple MP3 players for Linux compatibility
+                        players = [
+                            ['mpg123', '-q', file_path],
+                            ['ffplay', '-nodisp', '-autoexit', '-v', 'quiet', file_path],
+                            ['cvlc', '--play-and-exit', '--intf', 'dummy', file_path]
+                        ]
+
+                        for player_cmd in players:
+                            try:
+                                result = subprocess.run(player_cmd, check=False,
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                               timeout=5)
+                                if result.returncode == 0:
+                                    break
+                            except (subprocess.TimeoutExpired, FileNotFoundError):
+                                continue
+                        print(f"Played sound: {event_type}")
+                    else:
+                        print(f"Sound file not found: {file_path}")
+            except Exception as e:
+                print(f"Error playing sound {event_type}: {e}")
+
+        # Play sound in separate thread to avoid blocking
+        sound_thread = threading.Thread(target=play_sound, daemon=True)
+        sound_thread.start()
+
+    def _cleanup_sound_system(self):
+        """Cleanup sound system resources"""
+        try:
+            # No specific cleanup needed for subprocess-based audio
+            print("Sound system cleanup completed")
+        except Exception as e:
+            print(f"Error during sound system cleanup: {e}")
+
     def _load_fish_analysis_data(self):
         """Load fish behavior data from video analysis cache"""
         cache_path = "FishVideoModeling/fish_body_cache.pkl"
@@ -455,7 +677,7 @@ class FishDisplayWithIMU:
         for i in range(count):
             # Generate random starting position within circle
             angle = random.uniform(0, 2 * math.pi)
-            radius = random.uniform(50, CIRCLE_RADIUS - 50)
+            radius = random.uniform(50, INIT_FISH_RADIUS)
             x = SCREEN_CENTER_X + radius * math.cos(angle)
             y = SCREEN_CENTER_Y + radius * math.sin(angle)
             
@@ -489,7 +711,7 @@ class FishDisplayWithIMU:
     def create_scroll_packet(self, scroll_x, scroll_y, rotation=0):
         """Create protocol ID 0x01 packet for scroll commands"""
         timestamp = int(time.time() * 1000) & 0xFFFFFFFF
-        
+
         packet = bytearray()
         packet.append(0x01)  # Protocol ID
         # packet.extend(b'\x00\x00')  # Padding
@@ -497,6 +719,19 @@ class FishDisplayWithIMU:
         packet.extend(struct.pack('<i', scroll_x))
         packet.extend(struct.pack('<i', scroll_y))
         packet.extend(struct.pack('<h', rotation))
+
+        return bytes(packet)
+
+    def create_game_event_packet(self, sound_flag, health_value):
+        """Create protocol ID 0x03 packet for game events"""
+        timestamp = int(time.time() * 1000) & 0xFFFFFFFF
+
+        packet = bytearray()
+        packet.append(0x03)  # Protocol ID
+        packet.extend(struct.pack('<I', timestamp))
+        packet.append(sound_flag)   # 1=trial, 2=success, 3=game_clear, 4=game_over
+        packet.append(health_value) # 0-3 health points
+        packet.append(0)            # Reserved byte
         
         return bytes(packet)
     
@@ -507,12 +742,14 @@ class FishDisplayWithIMU:
             data = self.ser.read(32)  # Read up to 32 bytes
             if data:
                 self.receive_buffer.extend(data)
-                
+
                 # Process complete packets
                 while len(self.receive_buffer) >= 18:  # IMU packet size
                     if self.receive_buffer[0] == 0x01:  # IMU data packet
                         packet_data = bytes(self.receive_buffer[:18])
                         if self.imu_processor.process_imu_packet(packet_data):
+                            # Process motion detection for fish catching
+                            self._process_motion_detection()
                             # Successfully processed, remove from buffer
                             del self.receive_buffer[:18]
                         else:
@@ -521,9 +758,103 @@ class FishDisplayWithIMU:
                     else:
                         # Unknown packet, shift buffer
                         del self.receive_buffer[0]
-                        
+
         except serial.SerialException as e:
             print(f"Serial error: {e}")
+
+    def _process_motion_detection(self):
+        """Process motion detection for fish catching"""
+        if self.game_over:
+            return
+
+        # Skip motion detection during stability delay period
+        current_time = time.time()
+        if current_time - self.start_time < self.stability_delay:
+            return
+
+        # Get current acceleration data
+        accel_x = self.imu_processor.accel_x
+        accel_y = self.imu_processor.accel_y
+        accel_z = self.imu_processor.accel_z
+
+        # Update motion detector
+        catching_motion_detected = self.motion_detector.update_acceleration(accel_x, accel_y, accel_z)
+
+        if catching_motion_detected:
+            self._process_catch_attempt()
+
+    def _process_catch_attempt(self):
+        """Process a fish catching attempt"""
+        # Get current scroll position to determine absolute target position
+        scroll_cmd = self.imu_processor.get_scroll_command()
+        target_world_x = SCREEN_CENTER_X + CATCH_TARGET_X + scroll_cmd['scroll_x']
+        target_world_y = SCREEN_CENTER_Y + CATCH_TARGET_Y + scroll_cmd['scroll_y']
+
+        # Check if any fish are within catching radius
+        caught_fish = []
+        min_distance = np.inf
+        min_index = -1
+        for i, fish_model in enumerate(self.fish_models):
+            fish_x, fish_y = fish_model.position
+            distance = math.sqrt((fish_x - target_world_x)**2 + (fish_y - target_world_y)**2)
+            
+            if min_distance > distance:
+                min_distance = distance
+                min_index = i
+            if distance <= CATCH_RADIUS:
+                caught_fish.append(i)
+
+        print(f"nearlest fish:{self.fish_models[min_index].position} scroll pos:{scroll_cmd['scroll_x'], scroll_cmd['scroll_y']}    dinstance:{min_distance}")
+
+        if caught_fish:
+            # Success! Remove caught fish
+            for fish_index in reversed(caught_fish):  # Remove in reverse order to maintain indices
+                self.fish_models.pop(fish_index)
+                self.fish_caught += 1
+
+            print(f"Fish caught! Total: {self.fish_caught}")
+
+            # Play success sound
+            self._play_sound_async('success')
+
+            # Send success event (health unchanged)
+            self._send_game_event(2, self.current_health)  # sound_flag=2 (success)
+
+            # Check for game clear (all fish caught)
+            if len(self.fish_models) == 0:
+                print("Game Clear! All fish caught!")
+                # Play game clear sound
+                self._play_sound_async('game_clear')
+                self._send_game_event(3, self.current_health)  # sound_flag=3 (game_clear)
+                self.game_over = True
+
+        else:
+            # Miss! Reduce health
+            self.current_health -= (1 if self.current_health > 0 else 0)
+            print(f"Missed! Health: {self.current_health}/3 poi remaining")
+
+            # Play trial sound (attempt made)
+            self._play_sound_async('trial')
+
+            # Send health update to ESP32
+            self._send_game_event(1, self.current_health)  # sound_flag=1 (trial)
+
+            if self.current_health <= 0:
+                # Game Over
+                print("Game Over! All poi used.")
+                # Play game over sound
+                self._play_sound_async('game_over')
+                self._send_game_event(4, 0)  # sound_flag=4 (game_over), health=0
+                self.game_over = True
+
+    def _send_game_event(self, sound_flag, health_value):
+        """Send game event to ESP32"""
+        try:
+            packet = self.create_game_event_packet(sound_flag, health_value)
+            self.ser.write(packet)
+            print(f"Game event sent: sound={sound_flag}, health={health_value}")
+        except Exception as e:
+            print(f"Failed to send game event: {e}")
     
     def update_fish_positions(self):
         """Update all fish positions using realistic models"""
@@ -547,9 +878,9 @@ class FishDisplayWithIMU:
     def send_fish_data(self):
         """Send current fish positions via serial"""
         fish_data = self.get_fish_data()
-        if fish_data:
-            packet = self.create_fish_packet(fish_data)
-            self.ser.write(packet)
+        # if fish_data:
+        packet = self.create_fish_packet(fish_data)
+        self.ser.write(packet)
     
     def send_scroll_command(self):
         """Send scroll command based on current IMU tilt"""
@@ -562,38 +893,49 @@ class FishDisplayWithIMU:
         self.ser.write(packet)
     
     def print_status(self):
-        """Print current system status with attitude and scroll input visualization"""
+        """Print current system status with attitude, motion detection, and game state"""
         debug_info = self.imu_processor.get_debug_info()
-        
+        motion_info = self.motion_detector.get_debug_info()
+
         # Status indicators
         stable_status = "STABLE" if debug_info['is_stable'] else "MOVING"
         zone_status = "ACTIVE" if not debug_info['in_dead_zone'] else "DEAD_ZONE"
-        
+        motion_status = "MOTION" if motion_info['motion_active'] else "STILL"
+
         # Tilt information
         tilt_info = (f"Tilt: R={debug_info['roll_deg']:+6.1f}° P={debug_info['pitch_deg']:+6.1f}° "
                      f"Total={debug_info['total_tilt']:5.1f}°")
-        
-        # Scroll input visualization
-        scroll_input = (f"Input: {debug_info['scroll_direction']} "
-                       f"({debug_info['scroll_input_x']:+.2f}, {debug_info['scroll_input_y']:+.2f}) "
-                       f"Mag={debug_info['scroll_input_magnitude']:.2f}")
-        
-        # Scroll state
-        scroll_state = (f"Pos=({debug_info['scroll_pos_x']:+6.0f},{debug_info['scroll_pos_y']:+6.0f}) "
-                       f"Vel=({debug_info['scroll_vel_x']:+5.1f},{debug_info['scroll_vel_y']:+5.1f})")
-        
-        # Timing information
-        timing_info = f"dt={debug_info['actual_dt']:.1f}ms"
-        
+
+        # Motion detection information
+        motion_detect = (f"Motion: Mag={motion_info['magnitude']:.2f}G Y={motion_info['y_accel']:+.2f}G "
+                        f"Thresh=[{motion_info['threshold_min']:.1f}-{motion_info['threshold_max']:.1f}]")
+
+        # Game state information
+        game_status = "GAME_OVER" if self.game_over else "PLAYING"
+        elapsed_time = time.time() - self.start_time
+        stability_status = "STABILIZING" if elapsed_time < self.stability_delay else "ACTIVE"
+        game_info = (f"Game: {game_status} Health={self.current_health}/3 "
+                    f"Caught={self.fish_caught} Fish={len(self.fish_models)} [{stability_status}]")
+
+        # Scroll state (abbreviated for space)
+        scroll_state = (f"Scroll: ({debug_info['scroll_pos_x']:+4.0f},{debug_info['scroll_pos_y']:+4.0f}) "
+                       f"Vel=({debug_info['scroll_vel_x']:+4.1f},{debug_info['scroll_vel_y']:+4.1f})")
+
         # Combine all information
-        print(f"{tilt_info} | {stable_status:6s} {zone_status:9s} | {scroll_input} | {scroll_state} | {timing_info}")
+        print(f"{tilt_info} | {stable_status:6s} {zone_status:9s} {motion_status:6s} | {motion_detect} | {game_info} | {scroll_state}")
     
     def run_simulation(self, duration_seconds=300, num_fish=4, update_rate_hz=10):
-        """Run the integrated fish display and IMU scroll system"""
-        print(f"Starting integrated fish display with IMU scrolling")
+        """Run the integrated fish display with IMU scrolling and fish catching game"""
+        print(f"Starting Fish Catching Game with IMU scrolling")
         print(f"Duration: {duration_seconds}s, Fish: {num_fish}, Rate: {update_rate_hz}Hz")
-        print("Tilt the device to scroll the fish display")
-        print("-" * 120)
+        print(f"Health: {self.current_health} hearts")
+        print("")
+        print("Game Instructions:")
+        print("1. Tilt device to scroll and find fish")
+        print(f"2. Position catch target at ({CATCH_TARGET_X}, {CATCH_TARGET_Y}) relative to center")
+        print("3. Make horizontal catching motion when fish is in target area")
+        print("4. Catch all fish to win, or lose health by missing")
+        print("-" * 140)
         
         self.initialize_fish(num_fish)
         
@@ -629,23 +971,132 @@ class FishDisplayWithIMU:
                 
         except KeyboardInterrupt:
             print("\nSimulation stopped by user")
-        
+
         self.running = False
         print("Simulation completed")
+
+        # Cleanup sound system
+        self._cleanup_sound_system()
+
         self.ser.close()
 
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python3 fish_sender_with_imu_scroll.py <serial_port>")
-        print("Example: python3 fish_sender_with_imu_scroll.py /dev/ttyUSB0")
-        print()
-        print("Integrated fish display system with IMU-based scrolling")
-        print("Receives IMU data from ESP32 and sends fish + scroll commands")
-        sys.exit(1)
+def find_usb_serial_ports():
+    """実際に接続されているUSBシリアルデバイスを検出"""
+    ports = serial.tools.list_ports.comports()
+    usb_ports = []
     
-    port = sys.argv[1]
-    system = FishDisplayWithIMU(port)
-    system.run_simulation(duration_seconds=300, num_fish=2, update_rate_hz=100)
+    for port in ports:
+        # USBデバイスのみをフィルタ（hwidにUSBまたはVID:PIDが含まれる）
+        if 'USB' in port.hwid or 'VID:PID' in port.hwid or 'ACM' in port.device:
+            # さらに接続テストを行う
+            if test_port_connection(port.device):
+                usb_ports.append({
+                    'device': port.device,
+                    'description': port.description,
+                    'hwid': port.hwid,
+                    'vid': port.vid,
+                    'pid': port.pid
+                })
+    
+    return usb_ports
+
+def test_port_connection(port_path, timeout=0.1):
+    """ポートに実際に接続できるかテスト"""
+    try:
+        # 接続テストのみ（即座にクローズ）
+        ser = serial.Serial(port_path, 115200, timeout=timeout)
+        ser.close()
+        return True
+    except (serial.SerialException, PermissionError, OSError):
+        return False
+
+def wait_for_usb_serial_port(retry_interval=3, timeout=None):
+    """
+    USBシリアルポートが見つかるまで待機（ループ）
+    
+    Args:
+        retry_interval: 再検索までの待機秒数
+        timeout: タイムアウト秒数（Noneの場合は無制限）
+    
+    Returns:
+        検出されたポートのデバイスパス、または None
+    """
+    start_time = time.time()
+    attempt = 0
+    
+    print("USBシリアルポートを検索中...")
+    print("ESP32などのデバイスを接続してください (Ctrl+C で中断)")
+    print("-" * 60)
+    
+    while True:
+        attempt += 1
+        ports = find_usb_serial_ports()
+        
+        if ports:
+            # ttyACMポートを優先
+            ttyacm_ports = [p for p in ports if 'ttyACM' in p['device']]
+            ttyusb_ports = [p for p in ports if 'ttyUSB' in p['device']]
+            
+            # 優先順位: ttyACM > ttyUSB > その他
+            if ttyacm_ports:
+                selected = ttyacm_ports[0]
+            elif ttyusb_ports:
+                selected = ttyusb_ports[0]
+            else:
+                selected = ports[0]
+            
+            print(f"\n✓ USBデバイス検出: {selected['device']}")
+            print(f"  説明: {selected['description']}")
+            if selected['vid'] and selected['pid']:
+                print(f"  VID:PID = {selected['vid']:04X}:{selected['pid']:04X}")
+            print()
+            
+            return selected['device']
+        
+        # タイムアウトチェック
+        if timeout and (time.time() - start_time) > timeout:
+            print(f"\nタイムアウト: {timeout}秒経過しました")
+            return None
+        
+        # 待機メッセージ
+        elapsed = int(time.time() - start_time)
+        print(f"[試行 {attempt}] USBデバイスなし ({elapsed}秒経過) - {retry_interval}秒後に再検索...", end='\r')
+        
+        try:
+            time.sleep(retry_interval)
+        except KeyboardInterrupt:
+            print("\n\n検索を中断しました")
+            return None
+        
+def main():
+
+    while True:
+        try:
+
+            if len(sys.argv) != 2:
+                print("Manual Usage: python3 fish_sender_with_imu_scroll.py <serial_port>")
+                print("Example: python3 fish_sender_with_imu_scroll.py /dev/ttyUSB0")
+                print()
+
+                port = wait_for_usb_serial_port()
+
+                print("Auto Selected:", port)
+
+            else:
+                port = sys.argv[1]
+
+            system = FishDisplayWithIMU(port)
+            system.run_simulation(duration_seconds=3600, num_fish=4, update_rate_hz=100)
+        
+        except Exception as e:
+            print(e)
+            print("reloading the system...")
+
+        except KeyboardInterrupt:
+            exit(0)
+
+        
+
 
 if __name__ == "__main__":
     main()

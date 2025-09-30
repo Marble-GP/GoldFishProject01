@@ -37,5 +37,8 @@ extern const lv_image_dsc_t IMID0x02_3;
 
 extern const lv_image_dsc_t background_480;
 
+// extern const lv_image_dsc_t heart;
+
+extern const lv_image_dsc_t poi;
 
 #endif
