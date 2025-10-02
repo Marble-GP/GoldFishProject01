@@ -36,14 +36,14 @@ int32_t scroll_offset_y = 0;
 uint32_t last_imu_time = 0;
 uint32_t last_lvgl_time = 0;
 uint32_t last_fish_update_time = 0;
-
 // Protocol structures
 struct FishData {
-    uint8_t sprite_id;
-    uint8_t reserved[2];
-    int32_t x;
-    int32_t y;
-    int16_t direction;
+    uint8_t sprite_id;        // Fish ID (not used for type)
+    uint8_t fish_type;        // 0 = Type A (red 0x01), 1 = Type B (black 0x02)
+    uint8_t reserved;         // Reserved for future use
+    int32_t x;                // World X coordinate
+    int32_t y;                // World Y coordinate
+    int16_t direction;        // Rotation angle (0-359 degrees)
 } __attribute__((packed));
 
 struct ProtocolPacket {
@@ -144,18 +144,21 @@ bool is_point_in_circle(int32_t x, int32_t y) {
     return (dx * dx + dy * dy) <= (CIRCLE_RADIUS * CIRCLE_RADIUS);
 }
 
-// Get fish image based on sprite ID and direction
-const lv_image_dsc_t* get_fish_image(uint8_t sprite_id, int16_t direction) {
+// Get fish image based on fish type and direction
+const lv_image_dsc_t* get_fish_image(uint8_t fish_type, int16_t direction) {
     const lv_image_dsc_t** fish_images;
-    if (sprite_id < 128) {
+
+    // fish_type: 0 = Type A (red 0x01), 1 = Type B (black 0x02)
+    if (fish_type == 0) {
         fish_images = fish_type_01_images;
     } else {
         fish_images = fish_type_02_images;
     }
-    
-    int frame = (direction + 45) / 90;
-    frame = frame % NUM_FISH_FRAMES;
-    
+
+    // Map direction angle to frame index (0-3)
+    int frame = ((direction + 45) / 90) % NUM_FISH_FRAMES;
+    if (frame < 0) frame += NUM_FISH_FRAMES;
+
     return fish_images[frame];
 }
 
@@ -175,7 +178,7 @@ void create_arrow_objects() {
         arrow_objects[i] = lv_label_create(lv_screen_active());
         lv_label_set_text(arrow_objects[i], LV_SYMBOL_RIGHT);  // Use built-in arrow symbol
         lv_obj_set_style_text_color(arrow_objects[i], lv_color_make(220, 100, 0), 0);  // Orange/yellow
-        lv_obj_set_style_text_font(arrow_objects[i], &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(arrow_objects[i], &lv_font_montserrat_24, 0);
         lv_obj_add_flag(arrow_objects[i], LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(arrow_objects[i]);
     }
@@ -325,7 +328,7 @@ void draw_fish_images() {
             continue;
         }
         
-        const lv_image_dsc_t* fish_img = get_fish_image(current_fish[i].sprite_id, current_fish[i].direction);
+        const lv_image_dsc_t* fish_img = get_fish_image(current_fish[i].fish_type, current_fish[i].direction);
         lv_image_set_src(fish_objects[i], fish_img);
         
         lv_coord_t img_w = fish_img->header.w;

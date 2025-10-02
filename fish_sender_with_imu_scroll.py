@@ -686,9 +686,13 @@ class FishDisplayWithIMU:
                 initial_position=(x, y),
                 training_data=self.fish_data_cache
             )
-            
+
+            # Randomly assign fish type: 0=Red (Type A), 1=Black (Type B)
+            fish_model.fish_type = random.choice([0, 1])
+
             self.fish_models.append(fish_model)
-            print(f"Fish {i}: initialized at ({x:.0f},{y:.0f})")
+            fish_type_name = "Red" if fish_model.fish_type == 0 else "Black"
+            print(f"Fish {i}: {fish_type_name} goldfish initialized at ({x:.0f},{y:.0f})")
     
     def create_fish_packet(self, fish_data):
         """Create protocol ID 0x02 packet for fish data"""
@@ -701,7 +705,8 @@ class FishDisplayWithIMU:
         
         for fish in fish_data:
             packet.append(fish['sprite_id'])
-            packet.extend(b'\x00\x00')  # Reserved bytes
+            packet.append(fish.get('fish_type', 0))  # 0=Red (0x01), 1=Black (0x02)
+            packet.append(0x00)  # Reserved byte
             packet.extend(struct.pack('<i', fish['x']))
             packet.extend(struct.pack('<i', fish['y']))
             packet.extend(struct.pack('<h', fish['direction']))
@@ -734,7 +739,9 @@ class FishDisplayWithIMU:
         packet.append(0)            # Reserved byte
         
         return bytes(packet)
-    
+
+
+        
     def process_incoming_data(self):
         """Process incoming IMU data from ESP32"""
         try:
@@ -866,7 +873,8 @@ class FishDisplayWithIMU:
         fish_data = []
         for i, fish_model in enumerate(self.fish_models):
             fish = {
-                'sprite_id': i % 3,  # Vary sprite types
+                'sprite_id': i,
+                'fish_type': fish_model.fish_type,  # 0=Red, 1=Black
                 'x': int(fish_model.position[0]),
                 'y': int(fish_model.position[1]),
                 'direction': int(fish_model.angle) % 360
