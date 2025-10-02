@@ -403,13 +403,16 @@ class IMUDataProcessor:
 class RealisticFishModel:
     """Fish movement model based on real video analysis data"""
     
-    def __init__(self, fish_id, initial_position=None, training_data=None):
+    def __init__(self, fish_id, initial_position=None, training_data=None, movement_radius=720):
         self.fish_id = fish_id
         self.position = np.array(initial_position if initial_position else (SCREEN_CENTER_X, SCREEN_CENTER_Y), dtype=float)
         self.velocity = np.array([0.0, 0.0])
         self.acceleration = np.array([0.0, 0.0])
         self.angle = 0.0
         self.curvature = 0.0
+
+        # Movement boundary (default: scroll limit 720px radius)
+        self.movement_radius = movement_radius
 
         # Time-stretch coefficient for relaxed movement
         self.K = 0.2
@@ -487,19 +490,19 @@ class RealisticFishModel:
             dx = new_position[0] - SCREEN_CENTER_X
             dy = new_position[1] - SCREEN_CENTER_Y
             distance = np.sqrt(dx*dx + dy*dy)
-            
-            if distance > CIRCLE_RADIUS:
+
+            if distance > self.movement_radius:
                 # Reflect velocity away from boundary
                 normal_x = dx / distance
                 normal_y = dy / distance
-                
+
                 dot_product = self.velocity[0] * normal_x + self.velocity[1] * normal_y
                 self.velocity[0] -= 2 * dot_product * normal_x
                 self.velocity[1] -= 2 * dot_product * normal_y
-                
+
                 # Place fish just inside boundary
-                new_position[0] = SCREEN_CENTER_X + normal_x * (CIRCLE_RADIUS - 5)
-                new_position[1] = SCREEN_CENTER_Y + normal_y * (CIRCLE_RADIUS - 5)
+                new_position[0] = SCREEN_CENTER_X + normal_x * (self.movement_radius - 5)
+                new_position[1] = SCREEN_CENTER_Y + normal_y * (self.movement_radius - 5)
         
         self.position = new_position
         
@@ -523,7 +526,7 @@ class RealisticFishModel:
         """Check if point is within circular boundary"""
         dx = x - SCREEN_CENTER_X
         dy = y - SCREEN_CENTER_Y
-        return (dx * dx + dy * dy) <= (CIRCLE_RADIUS * CIRCLE_RADIUS)
+        return (dx * dx + dy * dy) <= (self.movement_radius * self.movement_radius)
 
 class FishDisplayWithIMU:
     def __init__(self, port, baudrate=500000):

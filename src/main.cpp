@@ -87,6 +87,7 @@ lv_obj_t* background_tiles[9] = {nullptr};
 lv_obj_t* health_poi_objects[MAX_HEALTH] = {nullptr};  // Array of poi image objects
 lv_obj_t* arrow_objects[MAX_ARROWS] = {nullptr};      // Direction arrow canvas objects
 FishData current_fish[MAX_FISH];
+FishData prev_fish[MAX_FISH];  // Previous frame fish data for change detection
 uint8_t active_fish_count = 0;
 uint8_t serial_buffer[SERIAL_BUFFER_SIZE];
 size_t buffer_pos = 0;
@@ -285,24 +286,42 @@ void update_health_display() {
 }
 
 
-// 魚描画関数も最適化
+// Optimized fish drawing with sprite batching and change detection
 void draw_fish_images() {
     static uint8_t prev_fish_count = 0;
     static int32_t prev_scroll_x = 0;
     static int32_t prev_scroll_y = 0;
-    
+    static bool first_run = true;
+
+    // Detect scroll changes
+    bool scroll_changed = (scroll_offset_x != prev_scroll_x) || (scroll_offset_y != prev_scroll_y);
+
     // Check if update is really needed
-    if (active_fish_count == prev_fish_count && 
-        scroll_offset_x == prev_scroll_x && 
-        scroll_offset_y == prev_scroll_y &&
-        !display_needs_update) {
-        return;
+    if (!scroll_changed &&
+        active_fish_count == prev_fish_count &&
+        !display_needs_update &&
+        !first_run) {
+        // Check if any fish actually changed
+        bool fish_changed = false;
+        for (int i = 0; i < active_fish_count && i < MAX_FISH; i++) {
+            if (current_fish[i].x != prev_fish[i].x ||
+                current_fish[i].y != prev_fish[i].y ||
+                current_fish[i].direction != prev_fish[i].direction ||
+                current_fish[i].fish_type != prev_fish[i].fish_type) {
+                fish_changed = true;
+                break;
+            }
+        }
+        if (!fish_changed) {
+            return;  // No changes detected, skip redraw
+        }
     }
-    
+
+    first_run = false;
     prev_fish_count = active_fish_count;
     prev_scroll_x = scroll_offset_x;
     prev_scroll_y = scroll_offset_y;
-    
+
     // 魚が0匹の場合は全て非表示にして終了
     if (active_fish_count == 0) {
         for (int i = 0; i < MAX_FISH; i++) {
@@ -315,37 +334,68 @@ void draw_fish_images() {
         display_needs_update = false;
         return;  // 背景のみ表示で処理終了
     }
-    
-    // 通常の魚描画処理
-    // Hide all fish objects first
-    for (int i = 0; i < MAX_FISH; i++) {
-        lv_obj_add_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN);
-    }
-    
-    // Show and position active fish
-    for (int i = 0; i < active_fish_count && i < MAX_FISH; i++) {
-        if (!is_point_in_circle(current_fish[i].x, current_fish[i].y)) {
-            continue;
-        }
-        
-        const lv_image_dsc_t* fish_img = get_fish_image(current_fish[i].fish_type, current_fish[i].direction);
-        lv_image_set_src(fish_objects[i], fish_img);
-        
-        lv_coord_t img_w = fish_img->header.w;
-        lv_coord_t img_h = fish_img->header.h;
-        
-        int32_t display_x = current_fish[i].x - scroll_offset_x;
-        int32_t display_y = current_fish[i].y - scroll_offset_y;
-        
-        if (!is_point_in_circle(display_x, display_y)) {
-            continue;
-        }
-        
-        lv_obj_set_pos(fish_objects[i],
-                       display_x - img_w / 2,
-                       display_y - img_h / 2);
 
-        lv_obj_clear_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN);
+    // Batch processing: Calculate all display positions first
+    struct FishRenderData {
+        int32_t display_x;
+        int32_t display_y;
+        const lv_image_dsc_t* img;
+        bool visible;
+        bool changed;
+    };
+
+    FishRenderData render_data[MAX_FISH];
+
+    // Phase 1: Calculate all fish positions and visibility (batch computation)
+    for (int i = 0; i < active_fish_count && i < MAX_FISH; i++) {
+        render_data[i].display_x = current_fish[i].x - scroll_offset_x;
+        render_data[i].display_y = current_fish[i].y - scroll_offset_y;
+        render_data[i].visible = is_point_in_circle(render_data[i].display_x, render_data[i].display_y);
+        render_data[i].img = get_fish_image(current_fish[i].fish_type, current_fish[i].direction);
+
+        // Detect if this specific fish changed
+        render_data[i].changed = scroll_changed ||
+                                 (current_fish[i].x != prev_fish[i].x) ||
+                                 (current_fish[i].y != prev_fish[i].y) ||
+                                 (current_fish[i].direction != prev_fish[i].direction) ||
+                                 (current_fish[i].fish_type != prev_fish[i].fish_type);
+
+        // Store current state for next frame comparison
+        prev_fish[i] = current_fish[i];
+    }
+
+    // Phase 2: Update only changed fish (batch update)
+    for (int i = 0; i < active_fish_count && i < MAX_FISH; i++) {
+        if (!render_data[i].visible) {
+            // Hide offscreen fish (only if it was visible before)
+            if (!lv_obj_has_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_add_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN);
+            }
+            continue;
+        }
+
+        // Only update if fish changed or just became visible
+        if (render_data[i].changed || lv_obj_has_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN)) {
+            // Update image source
+            lv_image_set_src(fish_objects[i], render_data[i].img);
+
+            // Update position
+            lv_coord_t img_w = render_data[i].img->header.w;
+            lv_coord_t img_h = render_data[i].img->header.h;
+            lv_obj_set_pos(fish_objects[i],
+                          render_data[i].display_x - img_w / 2,
+                          render_data[i].display_y - img_h / 2);
+
+            // Show fish
+            lv_obj_clear_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    // Phase 3: Hide unused fish slots
+    for (int i = active_fish_count; i < MAX_FISH; i++) {
+        if (!lv_obj_has_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(fish_objects[i], LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     // Draw direction arrows for offscreen fish
